@@ -1,6 +1,6 @@
 # Vulkan Memory Allocator
 
-Easy to integrate Vulkan memory allocation library.
+Easy to integrate Vulkan memory allocation library. (cookie was here)
 
 **Documentation:** Browse online: [Vulkan Memory Allocator](https://gpuopen-librariesandsdks.github.io/VulkanMemoryAllocator/html/) (generated from Doxygen-style comments in [include/vk_mem_alloc.h](include/vk_mem_alloc.h))
 
