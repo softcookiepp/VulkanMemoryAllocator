@@ -484,6 +484,11 @@ typedef enum VmaAllocatorCreateFlagBits
     For more information, see \ref other_api_interop.
     */
     VMA_ALLOCATOR_CREATE_KHR_EXTERNAL_MEMORY_WIN32_BIT = 0x00000200,
+    
+    /**
+    Enables use of VK_KHR_device_group for controlling allocations on multiple physical devices
+     */
+    VMA_ALLOCATOR_CREATE_KHR_DEVICE_GROUP_BIT = 0x00000400,
 
     VMA_ALLOCATOR_CREATE_FLAG_BITS_MAX_ENUM = 0x7FFFFFFF
 } VmaAllocatorCreateFlagBits;
@@ -1145,6 +1150,16 @@ typedef struct VmaAllocatorCreateInfo
     */
     const VkExternalMemoryHandleTypeFlagsKHR* VMA_NULLABLE VMA_LEN_IF_NOT_NULL("VkPhysicalDeviceMemoryProperties::memoryTypeCount") pTypeExternalMemoryHandleTypes;
 #endif // #if VMA_EXTERNAL_MEMORY
+	
+	/** \brief Number of physical devices provided (only applicable if VMA_ALLOCATOR_CREATE_KHR_DEVICE_GROUP_BIT is set)
+	*/
+	uint32_t numPhysicalDevices;
+	
+	/** \brief Pointer to arrray of VkPhysicalDevice instances to be used if VMA_ALLOCATOR_CREATE_KHR_DEVICE_GROUP_BIT is set
+	If VMA_ALLOCATOR_CREATE_KHR_DEVICE_GROUP_BIT is not set, it is ignored.
+	*/
+	VkPhysicalDevice* pPhysicalDevices;
+	
 } VmaAllocatorCreateInfo;
 
 /// Information about existing #VmaAllocator object.
@@ -2678,6 +2693,17 @@ VMA_CALL_PRE VkResult VMA_CALL_POST vmaCreateBuffer(
     VkBuffer VMA_NULLABLE_NON_DISPATCHABLE* VMA_NOT_NULL pBuffer,
     VmaAllocation VMA_NULLABLE* VMA_NOT_NULL pAllocation,
     VmaAllocationInfo* VMA_NULLABLE pAllocationInfo);
+    
+/** \brief Creates a buffer with 
+*/
+VMA_CALL_PRE VkResult VMA_CALL_POST vmaCreateBufferOnPhysicalDevice(
+    VmaAllocator VMA_NOT_NULL allocator,
+    const VkBufferCreateInfo* VMA_NOT_NULL pBufferCreateInfo,
+    const VmaAllocationCreateInfo* VMA_NOT_NULL pAllocationCreateInfo,
+    VkBuffer VMA_NULLABLE_NON_DISPATCHABLE* VMA_NOT_NULL pBuffer,
+    VmaAllocation VMA_NULLABLE* VMA_NOT_NULL pAllocation,
+    VmaAllocationInfo* VMA_NULLABLE pAllocationInfo,
+    uint32_t deviceIndex);
 
 /** \brief Creates a buffer with additional minimum alignment.
 
@@ -10467,6 +10493,12 @@ public:
 
     VmaCurrentBudgetData m_Budget;
     VMA_ATOMIC_UINT32 m_DeviceMemoryCount; // Total number of VkDeviceMemory objects.
+    
+    // device group management
+    bool m_UseDeviceGroup;
+    uint32_t m_DeviceGroupSize;
+    VkPhysicalDevice m_GroupPhysicalDevices[VK_MAX_DEVICE_GROUP_SIZE];
+    
 
     explicit VmaAllocator_T(const VmaAllocatorCreateInfo* pCreateInfo);
     VkResult Init(const VmaAllocatorCreateInfo* pCreateInfo);
@@ -10544,6 +10576,16 @@ public:
         VkBuffer* pBuffer,
         VmaAllocation* pAllocation,
         VmaAllocationInfo* pAllocationInfo);
+	// with device groups
+    VkResult CreateBuffer(
+        const VkBufferCreateInfo* pBufferCreateInfo,
+        const VmaAllocationCreateInfo* pAllocationCreateInfo,
+        VkDeviceSize minAlignment,
+        void* pMemoryAllocateNext, // pNext chain for VkMemoryAllocateInfo.
+        VkBuffer* pBuffer,
+        VmaAllocation* pAllocation,
+        VmaAllocationInfo* pAllocationInfo,
+        uint32_t deviceIndex);
     // Common code for public functions vmaCreateImage, vmaCreateDedicatedImage.
     VkResult CreateImage(
         const VkImageCreateInfo* pImageCreateInfo,
@@ -13166,7 +13208,11 @@ VmaAllocator_T::VmaAllocator_T(const VmaAllocatorCreateInfo* pCreateInfo) :
     m_PhysicalDevice(pCreateInfo->physicalDevice),
     m_GpuDefragmentationMemoryTypeBits(UINT32_MAX),
     m_NextPoolId(0),
-    m_GlobalMemoryTypeBits(UINT32_MAX)
+    m_GlobalMemoryTypeBits(UINT32_MAX),
+    
+	// device group management
+    m_UseDeviceGroup(pCreateInfo->flags & VMA_ALLOCATOR_CREATE_KHR_DEVICE_GROUP_BIT),
+    m_DeviceGroupSize(pCreateInfo->numPhysicalDevices)
 {
     if(m_VulkanApiVersion >= VK_MAKE_VERSION(1, 1, 0))
     {
@@ -13181,6 +13227,15 @@ VmaAllocator_T::VmaAllocator_T(const VmaAllocatorCreateInfo* pCreateInfo) :
     }
 
     VMA_ASSERT(pCreateInfo->physicalDevice && pCreateInfo->device && pCreateInfo->instance);
+    
+    if (m_UseDeviceGroup)
+    {
+		for (size_t i = 0; i < m_DeviceGroupSize; i += 1)
+		{
+			VMA_ASSERT(pCreateInfo->pPhysicalDevices[i]);
+			m_GroupPhysicalDevices[i] = pCreateInfo->pPhysicalDevices[i];
+		}
+	}
 
     if(m_VulkanApiVersion < VK_MAKE_VERSION(1, 1, 0))
     {
@@ -14242,6 +14297,20 @@ VkResult VmaAllocator_T::CreateBuffer(
     VkBuffer* pBuffer,
     VmaAllocation* pAllocation,
     VmaAllocationInfo* pAllocationInfo)
+{
+	return CreateBuffer(pBufferCreateInfo, pAllocationCreateInfo,
+		minAlignment, pMemoryAllocateNext, pBuffer, pAllocation, pAllocationInfo, 0);
+}
+
+VkResult VmaAllocator_T::CreateBuffer(
+    const VkBufferCreateInfo* pBufferCreateInfo,
+    const VmaAllocationCreateInfo* pAllocationCreateInfo,
+    VkDeviceSize minAlignment,
+    void* pMemoryAllocateNext,
+    VkBuffer* pBuffer,
+    VmaAllocation* pAllocation,
+    VmaAllocationInfo* pAllocationInfo,
+    uint32_t deviceIndex)
 {
     *pBuffer = VK_NULL_HANDLE;
     *pAllocation = VK_NULL_HANDLE;
@@ -16667,6 +16736,27 @@ VMA_CALL_PRE VkResult VMA_CALL_POST vmaCreateBuffer(
         1, // minAlignment
         VMA_NULL, // pMemoryAllocateNext
         pBuffer, pAllocation, pAllocationInfo);
+
+}
+
+VMA_CALL_PRE VkResult VMA_CALL_POST vmaCreateBufferOnPhysicalDevice(
+    VmaAllocator allocator,
+    const VkBufferCreateInfo* pBufferCreateInfo,
+    const VmaAllocationCreateInfo* pAllocationCreateInfo,
+    VkBuffer* pBuffer,
+    VmaAllocation* pAllocation,
+    VmaAllocationInfo* pAllocationInfo,
+    uint32_t deviceIndex)
+{
+    VMA_ASSERT(allocator && pBufferCreateInfo && pAllocationCreateInfo && pBuffer && pAllocation);
+    VMA_ASSERT(allocator->m_UseDeviceGroup); // cannot be used without enabling device groups
+    VMA_DEBUG_LOG("vmaCreateBuffer");
+    VMA_DEBUG_GLOBAL_MUTEX_LOCK;
+
+    return allocator->CreateBuffer(pBufferCreateInfo, pAllocationCreateInfo,
+        1, // minAlignment
+        VMA_NULL, // pMemoryAllocateNext
+        pBuffer, pAllocation, pAllocationInfo, deviceIndex);
 
 }
 
