@@ -332,6 +332,8 @@ extern "C" {
     #define VMA_STATS_STRING_ENABLED 1
 #endif
 
+#define VMA_DEVICE_MASK_DEFAULT 0x1
+
 ////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////
 //
@@ -1151,15 +1153,23 @@ typedef struct VmaAllocatorCreateInfo
     const VkExternalMemoryHandleTypeFlagsKHR* VMA_NULLABLE VMA_LEN_IF_NOT_NULL("VkPhysicalDeviceMemoryProperties::memoryTypeCount") pTypeExternalMemoryHandleTypes;
 #endif // #if VMA_EXTERNAL_MEMORY
 	
+#if 1
+	/** \brief The device mask; is only used when VMA_ALLOCATOR_CREATE_KHR_DEVICE_GROUP_BIT is set
+	*/
+	uint32_t deviceMask;
+#else
 	/** \brief Number of physical devices provided (only applicable if VMA_ALLOCATOR_CREATE_KHR_DEVICE_GROUP_BIT is set)
 	*/
 	uint32_t numPhysicalDevices;
 	
-	/** \brief Pointer to arrray of VkPhysicalDevice instances to be used if VMA_ALLOCATOR_CREATE_KHR_DEVICE_GROUP_BIT is set
+	/** \brief Pointer to array of VkPhysicalDevice instances to be used if VMA_ALLOCATOR_CREATE_KHR_DEVICE_GROUP_BIT is set
 	If VMA_ALLOCATOR_CREATE_KHR_DEVICE_GROUP_BIT is not set, it is ignored.
 	*/
 	VkPhysicalDevice* pPhysicalDevices;
 	
+	/**
+	*/
+#endif
 } VmaAllocatorCreateInfo;
 
 /// Information about existing #VmaAllocator object.
@@ -2693,17 +2703,6 @@ VMA_CALL_PRE VkResult VMA_CALL_POST vmaCreateBuffer(
     VkBuffer VMA_NULLABLE_NON_DISPATCHABLE* VMA_NOT_NULL pBuffer,
     VmaAllocation VMA_NULLABLE* VMA_NOT_NULL pAllocation,
     VmaAllocationInfo* VMA_NULLABLE pAllocationInfo);
-    
-/** \brief Creates a buffer with 
-*/
-VMA_CALL_PRE VkResult VMA_CALL_POST vmaCreateBufferOnPhysicalDevice(
-    VmaAllocator VMA_NOT_NULL allocator,
-    const VkBufferCreateInfo* VMA_NOT_NULL pBufferCreateInfo,
-    const VmaAllocationCreateInfo* VMA_NOT_NULL pAllocationCreateInfo,
-    VkBuffer VMA_NULLABLE_NON_DISPATCHABLE* VMA_NOT_NULL pBuffer,
-    VmaAllocation VMA_NULLABLE* VMA_NOT_NULL pAllocation,
-    VmaAllocationInfo* VMA_NULLABLE pAllocationInfo,
-    uint32_t deviceIndex);
 
 /** \brief Creates a buffer with additional minimum alignment.
 
@@ -3042,6 +3041,7 @@ VMA_CALL_PRE void VMA_CALL_POST vmaFreeStatsString(
 #include <cinttypes>
 #include <utility>
 #include <type_traits>
+#include <map> // for device-specific block vectors and possibly other stuff
 
 #if !defined(VMA_CPP20)
     #if __cplusplus >= 202002L || _MSVC_LANG >= 202002L // C++20
@@ -10496,9 +10496,7 @@ public:
     
     // device group management
     bool m_UseDeviceGroup;
-    uint32_t m_DeviceGroupSize;
-    VkPhysicalDevice m_GroupPhysicalDevices[VK_MAX_DEVICE_GROUP_SIZE];
-    
+    uint32_t m_DeviceMask;
 
     explicit VmaAllocator_T(const VmaAllocatorCreateInfo* pCreateInfo);
     VkResult Init(const VmaAllocatorCreateInfo* pCreateInfo);
@@ -10576,16 +10574,6 @@ public:
         VkBuffer* pBuffer,
         VmaAllocation* pAllocation,
         VmaAllocationInfo* pAllocationInfo);
-	// with device groups
-    VkResult CreateBuffer(
-        const VkBufferCreateInfo* pBufferCreateInfo,
-        const VmaAllocationCreateInfo* pAllocationCreateInfo,
-        VkDeviceSize minAlignment,
-        void* pMemoryAllocateNext, // pNext chain for VkMemoryAllocateInfo.
-        VkBuffer* pBuffer,
-        VmaAllocation* pAllocation,
-        VmaAllocationInfo* pAllocationInfo,
-        uint32_t deviceIndex);
     // Common code for public functions vmaCreateImage, vmaCreateDedicatedImage.
     VkResult CreateImage(
         const VkImageCreateInfo* pImageCreateInfo,
@@ -12035,16 +12023,24 @@ VkResult VmaBlockVector::CreateBlock(VkDeviceSize blockSize, size_t* pNewBlockIn
     allocInfo.pNext = m_pMemoryAllocateNext;
     allocInfo.memoryTypeIndex = m_MemoryTypeIndex;
     allocInfo.allocationSize = blockSize;
-
+	
+	// the flags are sometimes used for stuff
+    VkMemoryAllocateFlagsInfoKHR allocFlagsInfo = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO_KHR };
+    allocFlagsInfo.flags = 0x0;
 #if VMA_BUFFER_DEVICE_ADDRESS
     // Every standalone block can potentially contain a buffer with VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT - always enable the feature.
-    VkMemoryAllocateFlagsInfoKHR allocFlagsInfo = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO_KHR };
     if (m_hAllocator->m_UseKhrBufferDeviceAddress)
     {
         allocFlagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT_KHR;
-        VmaPnextChainPushFront(&allocInfo, &allocFlagsInfo);
     }
 #endif // VMA_BUFFER_DEVICE_ADDRESS
+	// if device groups are used, use the provided device mask
+	if (m_hAllocator->m_UseDeviceGroup)
+	{
+		allocFlagsInfo.flags |= VK_MEMORY_ALLOCATE_DEVICE_MASK_BIT;
+		allocFlagsInfo.deviceMask = m_hAllocator->m_DeviceMask;
+	}
+	VmaPnextChainPushFront(&allocInfo, &allocFlagsInfo);
 
 #if VMA_MEMORY_PRIORITY
     VkMemoryPriorityAllocateInfoEXT priorityInfo = { VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT };
@@ -13211,8 +13207,7 @@ VmaAllocator_T::VmaAllocator_T(const VmaAllocatorCreateInfo* pCreateInfo) :
     m_GlobalMemoryTypeBits(UINT32_MAX),
     
 	// device group management
-    m_UseDeviceGroup(pCreateInfo->flags & VMA_ALLOCATOR_CREATE_KHR_DEVICE_GROUP_BIT),
-    m_DeviceGroupSize(pCreateInfo->numPhysicalDevices)
+    m_UseDeviceGroup(pCreateInfo->flags & VMA_ALLOCATOR_CREATE_KHR_DEVICE_GROUP_BIT)
 {
     if(m_VulkanApiVersion >= VK_MAKE_VERSION(1, 1, 0))
     {
@@ -13230,11 +13225,8 @@ VmaAllocator_T::VmaAllocator_T(const VmaAllocatorCreateInfo* pCreateInfo) :
     
     if (m_UseDeviceGroup)
     {
-		for (size_t i = 0; i < m_DeviceGroupSize; i += 1)
-		{
-			VMA_ASSERT(pCreateInfo->pPhysicalDevices[i]);
-			m_GroupPhysicalDevices[i] = pCreateInfo->pPhysicalDevices[i];
-		}
+		m_DeviceMask = pCreateInfo->deviceMask;
+		VMA_ASSERT(m_DeviceMask); // must actually have a device
 	}
 
     if(m_VulkanApiVersion < VK_MAKE_VERSION(1, 1, 0))
@@ -13917,9 +13909,10 @@ VkResult VmaAllocator_T::AllocateDedicatedMemory(
         }
     }
 #endif // #if VMA_DEDICATED_ALLOCATION || VMA_VULKAN_VERSION >= 1001000
-
+	
+	VkMemoryAllocateFlagsInfoKHR allocFlagsInfo = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO_KHR };
+	allocFlagsInfo.flags = 0x0;
 #if VMA_BUFFER_DEVICE_ADDRESS
-    VkMemoryAllocateFlagsInfoKHR allocFlagsInfo = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO_KHR };
     if(m_UseKhrBufferDeviceAddress)
     {
         bool canContainBufferWithDeviceAddress = true;
@@ -13939,6 +13932,12 @@ VkResult VmaAllocator_T::AllocateDedicatedMemory(
         }
     }
 #endif // #if VMA_BUFFER_DEVICE_ADDRESS
+	if (m_UseDeviceGroup)
+	{
+		allocFlagsInfo.flags |= VK_MEMORY_ALLOCATE_DEVICE_MASK_BIT;
+		allocFlagsInfo.deviceMask = m_DeviceMask;
+	}
+	VmaPnextChainPushFront(&allocInfo, &allocFlagsInfo);
 
 #if VMA_MEMORY_PRIORITY
     VkMemoryPriorityAllocateInfoEXT priorityInfo = { VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT };
@@ -14297,20 +14296,6 @@ VkResult VmaAllocator_T::CreateBuffer(
     VkBuffer* pBuffer,
     VmaAllocation* pAllocation,
     VmaAllocationInfo* pAllocationInfo)
-{
-	return CreateBuffer(pBufferCreateInfo, pAllocationCreateInfo,
-		minAlignment, pMemoryAllocateNext, pBuffer, pAllocation, pAllocationInfo, 0);
-}
-
-VkResult VmaAllocator_T::CreateBuffer(
-    const VkBufferCreateInfo* pBufferCreateInfo,
-    const VmaAllocationCreateInfo* pAllocationCreateInfo,
-    VkDeviceSize minAlignment,
-    void* pMemoryAllocateNext,
-    VkBuffer* pBuffer,
-    VmaAllocation* pAllocation,
-    VmaAllocationInfo* pAllocationInfo,
-    uint32_t deviceIndex)
 {
     *pBuffer = VK_NULL_HANDLE;
     *pAllocation = VK_NULL_HANDLE;
@@ -16736,27 +16721,6 @@ VMA_CALL_PRE VkResult VMA_CALL_POST vmaCreateBuffer(
         1, // minAlignment
         VMA_NULL, // pMemoryAllocateNext
         pBuffer, pAllocation, pAllocationInfo);
-
-}
-
-VMA_CALL_PRE VkResult VMA_CALL_POST vmaCreateBufferOnPhysicalDevice(
-    VmaAllocator allocator,
-    const VkBufferCreateInfo* pBufferCreateInfo,
-    const VmaAllocationCreateInfo* pAllocationCreateInfo,
-    VkBuffer* pBuffer,
-    VmaAllocation* pAllocation,
-    VmaAllocationInfo* pAllocationInfo,
-    uint32_t deviceIndex)
-{
-    VMA_ASSERT(allocator && pBufferCreateInfo && pAllocationCreateInfo && pBuffer && pAllocation);
-    VMA_ASSERT(allocator->m_UseDeviceGroup); // cannot be used without enabling device groups
-    VMA_DEBUG_LOG("vmaCreateBuffer");
-    VMA_DEBUG_GLOBAL_MUTEX_LOCK;
-
-    return allocator->CreateBuffer(pBufferCreateInfo, pAllocationCreateInfo,
-        1, // minAlignment
-        VMA_NULL, // pMemoryAllocateNext
-        pBuffer, pAllocation, pAllocationInfo, deviceIndex);
 
 }
 
