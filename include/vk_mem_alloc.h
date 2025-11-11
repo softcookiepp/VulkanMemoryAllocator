@@ -10496,6 +10496,7 @@ public:
     
     // device group management
     bool m_UseDeviceGroup;
+    bool m_MultiDevice; // whether or not m_DeviceMask specifies multiple devices
     uint32_t m_DeviceMask;
 
     explicit VmaAllocator_T(const VmaAllocatorCreateInfo* pCreateInfo);
@@ -13227,6 +13228,15 @@ VmaAllocator_T::VmaAllocator_T(const VmaAllocatorCreateInfo* pCreateInfo) :
     {
 		m_DeviceMask = pCreateInfo->deviceMask;
 		VMA_ASSERT(m_DeviceMask); // must actually have a device
+		
+		// check if multiple devices are present
+		m_MultiDevice = false;
+		uint32_t deviceCount = 0;
+		for (uint32_t i = 0; i < 32; i += 1)
+		{
+			if ( (0x1 << i) & m_DeviceMask) deviceCount += 1;
+		}
+		if (deviceCount > 1) m_MultiDevice = true;
 	}
 
     if(m_VulkanApiVersion < VK_MAKE_VERSION(1, 1, 0))
@@ -13359,8 +13369,12 @@ VmaAllocator_T::VmaAllocator_T(const VmaAllocatorCreateInfo* pCreateInfo) :
 
     for(uint32_t memTypeIndex = 0; memTypeIndex < GetMemoryTypeCount(); ++memTypeIndex)
     {
+		// heap must have VK_MEMORY_HEAP_MULTI_INSTANCE_BIT if m_MultiDevice
+		uint32_t heapIndex = MemoryTypeIndexToHeapIndex(memTypeIndex);
+		const VkMemoryHeap& heapInfo = m_MemProps.memoryHeaps[heapIndex];
+		
         // Create only supported types
-        if((m_GlobalMemoryTypeBits & (1U << memTypeIndex)) != 0)
+        if((m_GlobalMemoryTypeBits & (1U << memTypeIndex)) != 0 && (!m_MultiDevice || heapInfo.flags & VK_MEMORY_HEAP_MULTI_INSTANCE_BIT))
         {
             const VkDeviceSize preferredBlockSize = CalcPreferredBlockSize(memTypeIndex);
             m_pBlockVectors[memTypeIndex] = vma_new(this, VmaBlockVector)(
@@ -14165,8 +14179,12 @@ VkResult VmaAllocator_T::FindMemoryTypeIndex(
         memTypeIndex < GetMemoryTypeCount();
         ++memTypeIndex, memTypeBit <<= 1)
     {
+		// heap must have VK_MEMORY_HEAP_MULTI_INSTANCE_BIT if m_MultiDevice
+		uint32_t heapIndex = MemoryTypeIndexToHeapIndex(memTypeIndex);
+		const VkMemoryHeap& heapInfo = m_MemProps.memoryHeaps[heapIndex];
+		
         // This memory type is acceptable according to memoryTypeBits bitmask.
-        if((memTypeBit & memoryTypeBits) != 0)
+        if((memTypeBit & memoryTypeBits) != 0 && (!m_MultiDevice || heapInfo.flags & VK_MEMORY_HEAP_MULTI_INSTANCE_BIT))
         {
             const VkMemoryPropertyFlags currFlags =
                 m_MemProps.memoryTypes[memTypeIndex].propertyFlags;
